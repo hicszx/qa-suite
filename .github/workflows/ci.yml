@@ -1,0 +1,165 @@
+name: CI — Pruebas automatizadas
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 13 * * 1-5'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CI: true
+
+jobs:
+  api-tests:
+    name: API (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Ejecutar pruebas API
+        run: npx playwright test --project=api
+      - name: Resumen
+        if: always()
+        run: npm run summary -- "API"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: allure-results-api
+          path: allure-results
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-api
+          path: playwright-report
+          if-no-files-found: ignore
+
+  e2e-tests:
+    name: E2E (Playwright, Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Instalar Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Ejecutar pruebas E2E
+        run: npx playwright test --project=e2e
+      - name: Resumen
+        if: always()
+        run: npm run summary -- "E2E"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: allure-results-e2e
+          path: allure-results
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-e2e
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+
+  allure-report:
+    name: Reporte Allure combinado
+    runs-on: ubuntu-latest
+    needs: [api-tests, e2e-tests]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: allure-results-*
+          path: allure-results
+          merge-multiple: true
+      - name: Generar Allure
+        run: npx allure generate allure-results --clean -o allure-report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report
+      - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: allure-report
+
+  publish-report:
+    name: Publicar Allure en GitHub Pages
+    runs-on: ubuntu-latest
+    needs: allure-report
+    if: always() && needs.allure-report.result == 'success' && github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+
+  notify:
+    name: Notificar resultados
+    runs-on: ubuntu-latest
+    needs: [api-tests, e2e-tests]
+    if: always()
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Calcular estado
+        id: status
+        run: |
+          if [ "${{ needs.api-tests.result }}" = "success" ] && [ "${{ needs.e2e-tests.result }}" = "success" ]; then
+            echo "icon=✅" >> "$GITHUB_OUTPUT"; echo "text=PASSED" >> "$GITHUB_OUTPUT"
+          else
+            echo "icon=❌" >> "$GITHUB_OUTPUT"; echo "text=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Slack (opcional, requiere secret SLACK_WEBHOOK_URL)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${{ steps.status.outputs.icon }} *${{ steps.status.outputs.text }}* — ${{ github.repository }} @ ${{ github.ref_name }}\nAPI: ${{ needs.api-tests.result }} | E2E: ${{ needs.e2e-tests.result }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Ver ejecución>\"}" \
+            "$SLACK_WEBHOOK_URL"
+      - name: Resumen en la corrida
+        run: |
+          {
+            echo "## ${{ steps.status.outputs.icon }} ${{ steps.status.outputs.text }}"
+            echo ""
+            echo "| Suite | Resultado |"
+            echo "|---|---|"
+            echo "| API | ${{ needs.api-tests.result }} |"
+            echo "| E2E | ${{ needs.e2e-tests.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Fallar el job si alguna suite falló
+        if: steps.status.outputs.text == 'FAILED'
+        run: exit 1
